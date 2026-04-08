@@ -38,7 +38,7 @@ snapshot_download(
 
 # 6. Split dataset
 echo "[6/7] Splitting dataset."
-python split_dataset.py --data_dir datasets --output data/data_split.json
+python split_dataset.py --data_dir "dataset/dataset" --output data/data_split.json
 
 
 # 7. Training
