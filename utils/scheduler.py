@@ -4,15 +4,6 @@ import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, MultiStepLR
 
 def get_scheduler(args, optimizer: torch.optim):
-    """Generate the learning rate scheduler for **every epoch**
-
-    Args:
-        optimizer (torch.optim): Optimizer
-        epochs (int): training epochs
-
-    Returns:
-        lr_scheduler
-    """
     epochs = args.epochs
 
     if args.scheduler == 'warmup_cosine':

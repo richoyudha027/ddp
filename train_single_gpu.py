@@ -77,7 +77,7 @@ def train(args, epoch, model, train_loader, loss_fn, optimizer, scheduler,
     num_samples = 0
     epoch_start = time.time()
 
-    pbar = tqdm(train_loader, desc=f"Epoch [{epoch}]", leave=True)
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=True)
     for i, (image, label, _, _) in enumerate(pbar):
         image = image.cuda()
         label = label.float().cuda()
@@ -253,7 +253,7 @@ def main():
     test_loader, _ = get_infer_loader(args, split['test'], distributed=False)
     
     logger.info("—" * 50)
-    logger.info("DATASET SPLIT".center(50))
+    logger.info("DATA SPLIT SUMMARY".center(50))
     logger.info("—" * 50)
     logger.info(f"Train      : {len(split['train'])}")
     logger.info(f"Validation : {len(split['val'])}")
