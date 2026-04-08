@@ -1,0 +1,9 @@
+monai==1.5.2
+numpy
+scikit-learn
+scipy
+huggingface_hub
+tensorboard
+tqdm
+einops
+medpy
