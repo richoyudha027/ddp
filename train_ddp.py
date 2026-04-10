@@ -165,7 +165,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
     compute_time_total = 0.0
     comm_time_total = 0.0
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=True) if is_main_process(args) else train_loader
+    pbar = tqdm(train_loader, desc=f"Epoch [{epoch}]", leave=True) if is_main_process(args) else train_loader
     for i, (image, label, _, _) in enumerate(pbar):
         image = image.cuda(args.local_rank, non_blocking=True)
         label = label.float().cuda(args.local_rank, non_blocking=True)
@@ -478,7 +478,7 @@ def main():
                 best_epoch = epoch
                 if is_main_process(args):
                     best_model = deepcopy(model.module.state_dict())
-                    logger.info(f"NEW BEST MODEL at epoch {epoch} with mean Dice {best_dice:.4f}")
+                    logger.info(f"NEW BEST MODEL at epoch [{epoch}] with mean Dice {best_dice:.4f}")
 
         torch.cuda.empty_cache()
 
@@ -536,7 +536,7 @@ def main():
             )
 
     if is_main_process(args) and best_model is not None:
-        logger.info(f"Testing best model from epoch {best_epoch} (mean Dice {best_dice:.4f})")
+        logger.info(f"Testing best model from epoch [{best_epoch}] (mean Dice {best_dice:.4f})")
         model.module.load_state_dict(best_model)
         test_metrics = evaluate(
             args, best_epoch, model, test_loader, loss_fn, writer, logger, mode='test'
