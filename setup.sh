@@ -114,5 +114,4 @@ echo "    --master_addr <MASTER_IP> \\"
 echo "    --nnodes 8 \\"
 echo "    --node_rank <0_to_7>"
 
-echo "tmux resize-window -A -t train"
-echo "tmux attach -t train"
+echo "tmux new -s train"
