@@ -76,9 +76,9 @@ def setup_multinode_ddp(args):
     ip_addr = socket.gethostbyname(hostname)
     print(
         f"[Node {rank}/{world_size}] Initializing DDP\n"
-        f"host    = {hostname} ({ip_addr})\n"
-        f"master  = {master_addr}:{master_port}\n"
-        f"backend = {args.dist_backend}"
+        f"Host    = {hostname} ({ip_addr})\n"
+        f"Master  = {master_addr}:{master_port}\n"
+        f"Backend = {args.dist_backend}"
     )
 
     dist.init_process_group(
@@ -93,7 +93,7 @@ def setup_multinode_ddp(args):
 
     dist.barrier()
     if rank == 0:
-        print(f"[Master] All {world_size} nodes connected successfully!")
+        print(f"[MASTER] All {world_size} nodes connected successfully!")
 
 
 def cleanup_ddp():
@@ -233,18 +233,18 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
 
     if is_main_process(args):
         logger.info(
-            f"Train [{epoch}]\n"
-            f"Loss      = {loss_meter.avg:.4f}\n"
-            f"BCE       = {bce_meter.avg:.4f}\n"
-            f"Dice      = {dsc_meter.avg:.4f}\n"
-            f"LR        = {optimizer.param_groups[0]['lr']:.6f}\n"
-            f"Time      = {format_time(epoch_time)}\n"
-            f"NodeThrpt = {node_throughput:.2f} samp/s\n"
-            f"AggrThrpt = {aggregate_throughput:.2f} samp/s\n"
-            f"Compute   = {compute_ratio:.1f}%\n"
-            f"Comm      = {comm_ratio:.1f}%\n"
-            f"CommTime  = {comm_time_total:.2f}s\n"
-            f"Peak_GPU  = {peak_mem:.0f}MB\n"
+            f"Train [{epoch}], "
+            f"Loss      = {loss_meter.avg:.4f}, "
+            f"BCE       = {bce_meter.avg:.4f}, "
+            f"Dice      = {dsc_meter.avg:.4f}, "
+            f"LR        = {optimizer.param_groups[0]['lr']:.6f}, "
+            f"Time      = {format_time(epoch_time)}, "
+            f"NodeThrpt = {node_throughput:.2f} samp/s, "
+            f"AggrThrpt = {aggregate_throughput:.2f} samp/s, "
+            f"Compute   = {compute_ratio:.1f}%, "
+            f"Comm      = {comm_ratio:.1f}%, "
+            f"CommTime  = {comm_time_total:.2f}s, "
+            f"Peak_GPU  = {peak_mem:.0f}MB, "
         )
 
     if is_main_process(args) and writer is not None:
@@ -332,14 +332,14 @@ def evaluate(args, epoch, model, infer_loader, loss_fn, writer, logger, mode='va
 
     if is_main_process(args):
         logger.info(
-            f"{mode.capitalize()} Summary [{epoch}]\n"
-            f"Loss    = {loss_meter.avg:.4f}\n"
-            f"Dice_ET = {mean_dice['Dice_ET']:.4f} ± {std_dice['Dice_ET_std']:.4f}\n"
-            f"Dice_TC = {mean_dice['Dice_TC']:.4f} ± {std_dice['Dice_TC_std']:.4f}\n"
-            f"Dice_WT = {mean_dice['Dice_WT']:.4f} ± {std_dice['Dice_WT_std']:.4f}\n"
-            f"HD95_ET = {mean_hd95['HD95_ET']:.2f}\n"
-            f"HD95_TC = {mean_hd95['HD95_TC']:.2f}\n"
-            f"HD95_WT = {mean_hd95['HD95_WT']:.2f}\n"
+            f"{mode.capitalize()} Summary [{epoch}], "
+            f"Loss    = {loss_meter.avg:.4f}, "
+            f"Dice_ET = {mean_dice['Dice_ET']:.4f} ± {std_dice['Dice_ET_std']:.4f}, "
+            f"Dice_TC = {mean_dice['Dice_TC']:.4f} ± {std_dice['Dice_TC_std']:.4f}, "
+            f"Dice_WT = {mean_dice['Dice_WT']:.4f} ± {std_dice['Dice_WT_std']:.4f}, "
+            f"HD95_ET = {mean_hd95['HD95_ET']:.2f}, "
+            f"HD95_TC = {mean_hd95['HD95_TC']:.2f}, "
+            f"HD95_WT = {mean_hd95['HD95_WT']:.2f}, "
             f"Time    = {format_time(eval_time)}"
         )
 
