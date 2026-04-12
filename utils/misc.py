@@ -88,9 +88,9 @@ def seed_everything(seed=42):
 
 def initialization(args):
     seed_everything(args.seed)
-    local_rank = getattr(args, 'local_rank', 0)
+    rank = getattr(args, 'rank', 0)
 
-    if local_rank == 0:
+    if rank == 0:
         os.makedirs(args.exp_dir, exist_ok=True)
         writer = SummaryWriter(args.exp_dir)
 
@@ -120,4 +120,4 @@ def initialization(args):
     return logger, writer
 
 def is_main_process(args) -> bool:
-    return getattr(args, 'local_rank', 0) == 0
+    return getattr(args, 'rank', 0) == 0
