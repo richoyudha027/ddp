@@ -389,7 +389,7 @@ def main():
         logger.info(f"This node rank  : {args.rank}")
         if torch.cuda.is_available():
             logger.info(f"GPU             : {torch.cuda.get_device_name(0)}")
-            logger.info(f"GPU Memory      : {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
+            logger.info(f"GPU Memory      : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
         logger.info("—" * 60)
 
     split = load_split(args.split_file)
