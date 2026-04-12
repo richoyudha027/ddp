@@ -158,7 +158,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
     bce_meter = AverageMeter('BCE', ':.4f')
     dsc_meter = AverageMeter('Dice', ':.4f')
     loss_meter = AverageMeter('Loss', ':.4f')
-    comm_meter = AverageMeter('Comm', ':.4f') 
+    comm_meter = AverageMeter('Comm', ':.4f')
 
     num_samples = 0
     epoch_start = time.time()
@@ -271,6 +271,9 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
 
 @torch.no_grad()
 def evaluate(args, epoch, model, infer_loader, loss_fn, writer, logger, mode='val'):
+    if not is_main_process(args):
+        return {}
+
     model.eval()
 
     all_dice = []
@@ -281,7 +284,7 @@ def evaluate(args, epoch, model, infer_loader, loss_fn, writer, logger, mode='va
 
     eval_model = model.module if hasattr(model, 'module') else model
 
-    pbar = tqdm(infer_loader, desc=f"{mode.capitalize()} [{epoch}]", leave=True) if is_main_process(args) else infer_loader
+    pbar = tqdm(infer_loader, desc=f"{mode.capitalize()} [{epoch}]", leave=True)
     for i, (image, label, _, _) in enumerate(pbar):
         image = image.cuda(args.local_rank, non_blocking=True)
         label = label.float().cuda(args.local_rank, non_blocking=True)
@@ -312,7 +315,7 @@ def evaluate(args, epoch, model, infer_loader, loss_fn, writer, logger, mode='va
         all_dice.append(dice)
         all_hd95.append(hd95)
 
-        if is_main_process(args) and hasattr(pbar, 'set_postfix'):
+        if hasattr(pbar, 'set_postfix'):
             pbar.set_postfix(
                 Dice_ET=f"{dice[:, 2].mean():.3f}",
                 Dice_TC=f"{dice[:, 4].mean():.3f}",
@@ -330,28 +333,25 @@ def evaluate(args, epoch, model, infer_loader, loss_fn, writer, logger, mode='va
     std_dice = {f'Dice_{r}_std': all_dice[:, i].std() for i, r in enumerate(region_names)}
     infer_metrics = {**mean_dice, **mean_hd95}
 
-    if is_main_process(args):
-        logger.info(
-            f"{mode.capitalize()} Summary [{epoch}], "
-            f"Loss    = {loss_meter.avg:.4f}, "
-            f"Dice_ET = {mean_dice['Dice_ET']:.4f} ± {std_dice['Dice_ET_std']:.4f}, "
-            f"Dice_TC = {mean_dice['Dice_TC']:.4f} ± {std_dice['Dice_TC_std']:.4f}, "
-            f"Dice_WT = {mean_dice['Dice_WT']:.4f} ± {std_dice['Dice_WT_std']:.4f}, "
-            f"HD95_ET = {mean_hd95['HD95_ET']:.2f}, "
-            f"HD95_TC = {mean_hd95['HD95_TC']:.2f}, "
-            f"HD95_WT = {mean_hd95['HD95_WT']:.2f}, "
-            f"Time    = {format_time(eval_time)}"
-        )
+    logger.info(
+        f"{mode.capitalize()} Summary [{epoch}], "
+        f"Loss    = {loss_meter.avg:.4f}, "
+        f"Dice_ET = {mean_dice['Dice_ET']:.4f} ± {std_dice['Dice_ET_std']:.4f}, "
+        f"Dice_TC = {mean_dice['Dice_TC']:.4f} ± {std_dice['Dice_TC_std']:.4f}, "
+        f"Dice_WT = {mean_dice['Dice_WT']:.4f} ± {std_dice['Dice_WT_std']:.4f}, "
+        f"HD95_ET = {mean_hd95['HD95_ET']:.2f}, "
+        f"HD95_TC = {mean_hd95['HD95_TC']:.2f}, "
+        f"HD95_WT = {mean_hd95['HD95_WT']:.2f}, "
+        f"Time    = {format_time(eval_time)}"
+    )
 
-    if is_main_process(args) and writer is not None:
+    if writer is not None:
         for key, value in infer_metrics.items():
             writer.add_scalar(f"{mode}/{key}", value, epoch)
         for key, value in std_dice.items():
             writer.add_scalar(f"{mode}/{key}", value, epoch)
         writer.add_scalar(f'{mode}/loss', loss_meter.avg, epoch)
         writer.add_scalar(f'{mode}/eval_time_sec', eval_time, epoch)
-
-    dist.barrier()
 
     return infer_metrics
 
@@ -389,13 +389,19 @@ def main():
         logger.info(f"This node rank  : {args.rank}")
         if torch.cuda.is_available():
             logger.info(f"GPU             : {torch.cuda.get_device_name(0)}")
-            logger.info(f"GPU Memory      : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+            logger.info(f"GPU Memory      : {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
         logger.info("—" * 60)
 
     split = load_split(args.split_file)
     train_loader, train_sampler = get_train_loader(args, split['train'], distributed=True)
-    val_loader, _ = get_infer_loader(args, split['val'], distributed=False)
-    test_loader, _ = get_infer_loader(args, split['test'], distributed=False)
+
+    # Val and test loaders only needed on rank 0
+    if is_main_process(args):
+        val_loader, _ = get_infer_loader(args, split['val'], distributed=False)
+        test_loader, _ = get_infer_loader(args, split['test'], distributed=False)
+    else:
+        val_loader = None
+        test_loader = None
 
     if is_main_process(args):
         logger.info("—" * 60)
@@ -453,6 +459,14 @@ def main():
     comm_times = []
     total_train_start = time.time()
 
+    # Template for non-main nodes to participate in broadcast_dict
+    _empty_val_metrics = {
+        'Dice_NETC': 0.0, 'Dice_SNFH': 0.0, 'Dice_ET': 0.0,
+        'Dice_RC': 0.0, 'Dice_TC': 0.0, 'Dice_WT': 0.0,
+        'HD95_NETC': 0.0, 'HD95_SNFH': 0.0, 'HD95_ET': 0.0,
+        'HD95_RC': 0.0, 'HD95_TC': 0.0, 'HD95_WT': 0.0,
+    }
+
     for epoch in range(args.epochs):
         train_loss, epoch_time, comm_time = train(
             args, epoch, model, train_loader, train_sampler, loss_fn,
@@ -462,10 +476,19 @@ def main():
         comm_times.append(comm_time)
 
         if (epoch + 1) % args.eval_freq == 0:
+            # Only rank 0 runs evaluation; others get empty dict
             val_metrics = evaluate(
                 args, epoch, model, val_loader, loss_fn, writer, logger, mode='val'
             )
 
+            # All nodes sync here while rank 0 finishes eval
+            dist.barrier()
+
+            # Non-main nodes need matching keys for broadcast
+            if not is_main_process(args):
+                val_metrics = _empty_val_metrics.copy()
+
+            # Broadcast real metrics from rank 0 to all nodes
             val_metrics = broadcast_dict(val_metrics, src=0, device=f'cuda:{args.local_rank}')
 
             mean_dice = np.mean([
@@ -535,6 +558,7 @@ def main():
                 }
             )
 
+    # Final test — only rank 0, other nodes wait at cleanup_ddp's barrier
     if is_main_process(args) and best_model is not None:
         logger.info(f"Testing best model from epoch [{best_epoch}] (mean Dice {best_dice:.4f})")
         model.module.load_state_dict(best_model)
@@ -543,6 +567,7 @@ def main():
         )
 
         if args.save_model:
+            _, peak_mem, _ = get_gpu_memory_mb()
             save_path = os.path.join(args.exp_dir, "best_model.pth")
             torch.save({
                 'model': best_model,
@@ -552,8 +577,8 @@ def main():
                     'best_dice': best_dice,
                     'test_metrics': test_metrics,
                     'total_train_time': total_train_time,
-                    'total_comm_time': total_comm_time,
-                    'comm_pct': comm_pct,
+                    'total_comm_time': sum(comm_times),
+                    'comm_pct': (sum(comm_times) / total_train_time * 100) if total_train_time > 0 else 0,
                     'peak_gpu_memory_mb': peak_mem,
                     'num_nodes': args.world_size,
                     'global_batch_size': global_batch_size,
