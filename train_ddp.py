@@ -165,7 +165,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
     compute_time_total = 0.0
     comm_time_total = 0.0
 
-    pbar = tqdm(train_loader, desc=f"Epoch [{epoch}]", leave=True) if is_main_process(args) else train_loader
+    pbar = tqdm(train_loader, desc=f"Epoch [{epoch}] [Node {args.rank}]", leave=True)
     for i, (image, label, _, _) in enumerate(pbar):
         image = image.cuda(args.local_rank, non_blocking=True)
         label = label.float().cuda(args.local_rank, non_blocking=True)
