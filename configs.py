@@ -14,15 +14,10 @@ def parse_seg_args():
     #split
     parser.add_argument('--split_file', type=str, required=True, help='path to json file that contains data split info')
     
-    # ddp (multi-node support)
+    # ddp (multi-gpu support)
     parser.add_argument('--distributed', action='store_true', help='use DDP training')
     parser.add_argument('--dist_backend', type=str, default='nccl', help='DDP backend')
-    parser.add_argument('--local_rank', type=int, default=0, help='DDP local rank')
-    parser.add_argument('--master_addr', type=str, default='localhost', help='Master node IP address for multi-node DDP')
-    parser.add_argument('--master_port', type=str, default='29500', help='Master node port for multi-node DDP')
-    parser.add_argument('--nnodes', type=int, default=1, help='Number of nodes')
-    parser.add_argument('--node_rank', type=int, default=0, help='Rank of this node (0 = master)')
-    parser.add_argument('--nproc_per_node', type=int, default=1, help='Number of GPUs per node (1 for multi-node single GPU)')
+    parser.add_argument('--local_rank', type=int, default=0, help='DDP local rank (auto-set by torchrun)')
 
     # path & dir
     parser.add_argument('--exp_dir', type=str, default='exps', help='experiment dir')

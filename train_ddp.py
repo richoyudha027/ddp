@@ -1,9 +1,7 @@
 import os
 import time
-import socket
 import warnings
 from copy import deepcopy
-from datetime import timedelta
 
 from tqdm import tqdm
 
@@ -56,44 +54,35 @@ def get_gpu_memory_mb():
 #              DDP Setup & Cleanup
 # ------------------------------------------------
 
-def setup_multinode_ddp(args):
-    master_addr = os.environ.get('MASTER_ADDR', args.master_addr)
-    master_port = os.environ.get('MASTER_PORT', args.master_port)
-    world_size = int(os.environ.get('WORLD_SIZE', args.nnodes))
-    rank = int(os.environ.get('RANK', args.node_rank))
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+def setup_multigpu_ddp(args):
+    """
+    Initialize DDP for multi-GPU single-node training.
 
-    os.environ['MASTER_ADDR'] = master_addr
-    os.environ['MASTER_PORT'] = master_port
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['RANK'] = str(rank)
+    torchrun automatically sets LOCAL_RANK, RANK, WORLD_SIZE.
+    In single-node multi-GPU:
+        - world_size = number of GPUs
+        - rank = GPU index (0, 1, 2, ...)
+        - local_rank = same as rank (single node)
+    """
+    args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    args.rank = int(os.environ.get('RANK', 0))
+    args.world_size = int(os.environ.get('WORLD_SIZE', 1))
 
-    args.local_rank = local_rank
-    args.rank = rank
-    args.world_size = world_size
-
-    hostname = socket.gethostname()
-    ip_addr = socket.gethostbyname(hostname)
     print(
-        f"[Node {rank}/{world_size}] Initializing DDP\n"
-        f"Host    = {hostname} ({ip_addr})\n"
-        f"Master  = {master_addr}:{master_port}\n"
-        f"Backend = {args.dist_backend}"
+        f"[GPU {args.rank}/{args.world_size}] Initializing DDP | "
+        f"local_rank={args.local_rank} | backend={args.dist_backend}"
     )
 
     dist.init_process_group(
         backend=args.dist_backend,
         init_method='env://',
-        world_size=world_size,
-        rank=rank,
-        timeout=timedelta(minutes=60),
     )
 
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(args.local_rank)
 
     dist.barrier()
-    if rank == 0:
-        print(f"[MASTER] All {world_size} nodes connected successfully!")
+    if args.rank == 0:
+        print(f"[MASTER] All {args.world_size} GPUs connected successfully!")
 
 
 def cleanup_ddp():
@@ -165,7 +154,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
     compute_time_total = 0.0
     comm_time_total = 0.0
 
-    pbar = tqdm(train_loader, desc=f"Epoch [{epoch}] [Node {args.rank}]", leave=True)
+    pbar = tqdm(train_loader, desc=f"Epoch [{epoch}] [GPU {args.rank}]", leave=True)
     for i, (image, label, _, _) in enumerate(pbar):
         image = image.cuda(args.local_rank, non_blocking=True)
         label = label.float().cuda(args.local_rank, non_blocking=True)
@@ -223,7 +212,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
         scheduler.step()
 
     epoch_time = time.time() - epoch_start
-    node_throughput = num_samples / epoch_time
+    gpu_throughput = num_samples / epoch_time
     aggregate_throughput = (num_samples * args.world_size) / epoch_time
     total_time = compute_time_total + comm_time_total
     compute_ratio = (compute_time_total / total_time * 100) if total_time > 0 else 0
@@ -239,7 +228,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
             f"Dice      = {dsc_meter.avg:.4f}, "
             f"LR        = {optimizer.param_groups[0]['lr']:.6f}, "
             f"Time      = {format_time(epoch_time)}, "
-            f"NodeThrpt = {node_throughput:.2f} samp/s, "
+            f"GPU_Thrpt = {gpu_throughput:.2f} samp/s, "
             f"AggrThrpt = {aggregate_throughput:.2f} samp/s, "
             f"Compute   = {compute_ratio:.1f}%, "
             f"Comm      = {comm_ratio:.1f}%, "
@@ -253,7 +242,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
         writer.add_scalar('train/loss', loss_meter.avg, epoch)
         writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('train/epoch_time_sec', epoch_time, epoch)
-        writer.add_scalar('train/node_throughput_samples_per_sec', node_throughput, epoch)
+        writer.add_scalar('train/gpu_throughput_samples_per_sec', gpu_throughput, epoch)
         writer.add_scalar('train/aggregate_throughput_samples_per_sec', aggregate_throughput, epoch)
         writer.add_scalar('train/compute_ratio_pct', compute_ratio, epoch)
         writer.add_scalar('train/comm_ratio_pct', comm_ratio, epoch)
@@ -363,7 +352,7 @@ def evaluate(args, epoch, model, infer_loader, loss_fn, writer, logger, mode='va
 def main():
     args = parse_seg_args()
 
-    setup_multinode_ddp(args)
+    setup_multigpu_ddp(args)
 
     global_batch_size = args.batch_size * args.world_size
 
@@ -371,12 +360,12 @@ def main():
 
     if is_main_process(args):
         logger.info("—" * 60)
-        logger.info("EXPERIMENT CONFIGURATION (MULTI-NODE DDP)".center(60))
+        logger.info("EXPERIMENT CONFIGURATION (MULTI-GPU DDP)".center(60))
         logger.info("—" * 60)
         logger.info(f"Model           : {args.unet_arch} ({args.block} block)")
         logger.info(f"Channels        : {args.channels_list}")
         logger.info(f"Patch size      : {args.patch_size}")
-        logger.info(f"Batch size/node : {args.batch_size}")
+        logger.info(f"Batch size/GPU  : {args.batch_size}")
         logger.info(f"Global batch    : {global_batch_size}")
         logger.info(f"Scaling mode    : Strong (fixed global batch size)")
         logger.info(f"Epochs          : {args.epochs}")
@@ -385,8 +374,7 @@ def main():
         logger.info(f"AMP             : {args.amp}")
         logger.info(f"Deep superv.    : {args.deep_supervision}")
         logger.info(f"Seed            : {args.seed}")
-        logger.info(f"Num nodes       : {args.world_size}")
-        logger.info(f"This node rank  : {args.rank}")
+        logger.info(f"Num GPUs        : {args.world_size}")
         if torch.cuda.is_available():
             logger.info(f"GPU             : {torch.cuda.get_device_name(0)}")
             logger.info(f"GPU Memory      : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
@@ -407,11 +395,11 @@ def main():
         logger.info("—" * 60)
         logger.info("DATA SPLIT SUMMARY".center(60))
         logger.info("—" * 60)
-        logger.info(f"Train                    : {len(split['train'])}")
-        logger.info(f"Validation               : {len(split['val'])}")
-        logger.info(f"Test                     : {len(split['test'])}")
-        logger.info(f"Samples per node / epoch : ~{len(split['train']) // args.world_size}")
-        logger.info(f"Iterations per epoch     : ~{len(split['train']) // global_batch_size}")
+        logger.info(f"Train                   : {len(split['train'])}")
+        logger.info(f"Validation              : {len(split['val'])}")
+        logger.info(f"Test                    : {len(split['test'])}")
+        logger.info(f"Samples per GPU / epoch : ~{len(split['train']) // args.world_size}")
+        logger.info(f"Iterations per epoch    : ~{len(split['train']) // global_batch_size}")
         logger.info("—" * 60)
 
     model = get_unet(args).cuda(args.local_rank)
@@ -459,7 +447,7 @@ def main():
     comm_times = []
     total_train_start = time.time()
 
-    # Template for non-main nodes to participate in broadcast_dict
+    # Template for non-main GPUs to participate in broadcast_dict
     _empty_val_metrics = {
         'Dice_NETC': 0.0, 'Dice_SNFH': 0.0, 'Dice_ET': 0.0,
         'Dice_RC': 0.0, 'Dice_TC': 0.0, 'Dice_WT': 0.0,
@@ -481,14 +469,14 @@ def main():
                 args, epoch, model, val_loader, loss_fn, writer, logger, mode='val'
             )
 
-            # All nodes sync here while rank 0 finishes eval
+            # All GPUs sync here while rank 0 finishes eval
             dist.barrier()
 
-            # Non-main nodes need matching keys for broadcast
+            # Non-main GPUs need matching keys for broadcast
             if not is_main_process(args):
                 val_metrics = _empty_val_metrics.copy()
 
-            # Broadcast real metrics from rank 0 to all nodes
+            # Broadcast real metrics from rank 0 to all GPUs
             val_metrics = broadcast_dict(val_metrics, src=0, device=f'cuda:{args.local_rank}')
 
             mean_dice = np.mean([
@@ -515,10 +503,11 @@ def main():
         comm_pct = (total_comm_time / total_train_time * 100) if total_train_time > 0 else 0
 
         logger.info("—" * 60)
-        logger.info("TRAINING SUMMARY (MULTI-NODE DDP)".center(60))
+        logger.info("TRAINING SUMMARY (MULTI-GPU DDP)".center(60))
         logger.info("—" * 60)
         logger.info(f"Total training time      : {format_time(total_train_time)}")
         logger.info(f"Avg epoch time           : {format_time(avg_epoch_time)}")
+        logger.info(f"Median epoch time        : {format_time(np.median(epoch_times))}")
         logger.info(f"Min epoch time           : {format_time(min(epoch_times))}")
         logger.info(f"Max epoch time           : {format_time(max(epoch_times))}")
         logger.info(f"Total communication time : {format_time(total_comm_time)} ({comm_pct:.1f}% of total)")
@@ -527,7 +516,7 @@ def main():
         logger.info(f"Best epoch               : {best_epoch}")
         logger.info(f"Best mean Dice           : {best_dice:.4f}")
         logger.info(f"Total epochs trained     : {args.epochs}")
-        logger.info(f"Num nodes                : {args.world_size}")
+        logger.info(f"Num GPUs                 : {args.world_size}")
         logger.info(f"Global batch size        : {global_batch_size}")
         logger.info(f"Scaling mode             : Strong")
         logger.info("—" * 60)
@@ -536,7 +525,7 @@ def main():
             writer.add_hparams(
                 {
                     'model': args.unet_arch,
-                    'batch_size_per_node': args.batch_size,
+                    'batch_size_per_gpu': args.batch_size,
                     'global_batch_size': global_batch_size,
                     'scaling_mode': 'strong',
                     'lr': args.lr,
@@ -546,7 +535,7 @@ def main():
                     'epochs': args.epochs,
                     'amp': args.amp,
                     'deep_supervision': args.deep_supervision,
-                    'num_nodes': args.world_size,
+                    'num_gpus': args.world_size,
                 },
                 {
                     'hparam/best_dice': best_dice,
@@ -558,7 +547,7 @@ def main():
                 }
             )
 
-    # Final test — only rank 0, other nodes wait at cleanup_ddp's barrier
+    # Final test — only rank 0, other GPUs wait at cleanup_ddp's barrier
     if is_main_process(args) and best_model is not None:
         logger.info(f"Testing best model from epoch [{best_epoch}] (mean Dice {best_dice:.4f})")
         model.module.load_state_dict(best_model)
@@ -580,7 +569,7 @@ def main():
                     'total_comm_time': sum(comm_times),
                     'comm_pct': (sum(comm_times) / total_train_time * 100) if total_train_time > 0 else 0,
                     'peak_gpu_memory_mb': peak_mem,
-                    'num_nodes': args.world_size,
+                    'num_gpus': args.world_size,
                     'global_batch_size': global_batch_size,
                     'scaling_mode': 'strong',
                 },
