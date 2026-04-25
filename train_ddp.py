@@ -23,6 +23,7 @@ from utils.loss import SoftDiceBCEWithLogitsLoss
 from utils.misc import (AverageMeter, compute_eval_regions, initialization, is_main_process)
 from utils.optim import get_optimizer
 from utils.scheduler import get_scheduler
+from utils.timer import TimerCollector
 
 
 # ------------------------------------------------
@@ -55,15 +56,6 @@ def get_gpu_memory_mb():
 # ------------------------------------------------
 
 def setup_multigpu_ddp(args):
-    """
-    Initialize DDP for multi-GPU single-node training.
-
-    torchrun automatically sets LOCAL_RANK, RANK, WORLD_SIZE.
-    In single-node multi-GPU:
-        - world_size = number of GPUs
-        - rank = GPU index (0, 1, 2, ...)
-        - local_rank = same as rank (single node)
-    """
     args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
     args.rank = int(os.environ.get('RANK', 0))
     args.world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -89,24 +81,6 @@ def cleanup_ddp():
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
-
-
-# ------------------------------------------------
-#              Communication Helpers
-# ------------------------------------------------
-
-def reduce_tensor(tensor, world_size):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    rt /= world_size
-    return rt
-
-
-def broadcast_dict(data: dict, src=0, device='cuda'):
-    keys = sorted(data.keys())
-    values = torch.tensor([data[k] for k in keys], dtype=torch.float32, device=device)
-    dist.broadcast(values, src=src)
-    return {k: v.item() for k, v in zip(keys, values)}
 
 
 # ------------------------------------------------
@@ -140,83 +114,99 @@ def compute_deep_supervision_loss(preds, label, loss_fn, ds_weights=None):
 # ------------------------------------------------
 
 def train(args, epoch, model, train_loader, train_sampler, loss_fn,
-          optimizer, scheduler, scaler, writer, logger):
+          optimizer, scheduler, scaler, writer, logger, timer):
     model.train()
     train_sampler.set_epoch(epoch)
 
     bce_meter = AverageMeter('BCE', ':.4f')
     dsc_meter = AverageMeter('Dice', ':.4f')
     loss_meter = AverageMeter('Loss', ':.4f')
-    comm_meter = AverageMeter('Comm', ':.4f')
 
     num_samples = 0
-    epoch_start = time.time()
-    compute_time_total = 0.0
-    comm_time_total = 0.0
 
-    pbar = tqdm(train_loader, desc=f"Epoch [{epoch}] [GPU {args.rank}]", leave=True)
+    if is_main_process(args):
+        timer.start_epoch()
+        pbar = tqdm(train_loader, desc=f"Epoch [{epoch}]", leave=True)
+    else:
+        pbar = train_loader
+
     for i, (image, label, _, _) in enumerate(pbar):
         image = image.cuda(args.local_rank, non_blocking=True)
         label = label.float().cuda(args.local_rank, non_blocking=True)
         bsz = image.size(0)
         num_samples += bsz
 
-        compute_start = time.time()
+        if is_main_process(args):
+            timer.start_iter()
+            timer.start_fwd()
 
+        # Forward
         with autocast('cuda', enabled=args.amp):
             preds = model(image)
             bce_loss, dsc_loss = compute_deep_supervision_loss(preds, label, loss_fn)
             loss = bce_loss + dsc_loss
 
+        fwd_time = timer.end_fwd() if is_main_process(args) else 0
+
+        if epoch == 0 and i == 0 and is_main_process(args):
+            if isinstance(preds, list):
+                logger.info(f"Model returns list of {len(preds)} outputs (DS={'on' if args.deep_supervision else 'off'})")
+            else:
+                logger.info(f"Model returns single tensor (DS={'on' if args.deep_supervision else 'off'})")
+
+        # Backward
+        if is_main_process(args):
+            timer.start_bwd()
+            
         optimizer.zero_grad()
         if args.amp and scaler is not None:
             scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        bwd_time = timer.end_bwd() if is_main_process(args) else 0
+
+        if is_main_process(args):
+            timer.start_opt()
+
+        # Optimizer step
+        if args.amp and scaler is not None:
             if args.clip_grad:
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), 10)
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss.backward()
             if args.clip_grad:
                 nn.utils.clip_grad_norm_(model.parameters(), 10)
             optimizer.step()
 
-        torch.cuda.synchronize()
-        compute_time = time.time() - compute_start
+        opt_time = timer.end_opt() if is_main_process(args) else 0
 
-        comm_start = time.time()
-        reduced_loss = reduce_tensor(loss.detach(), args.world_size)
-        reduced_bce = reduce_tensor(bce_loss.detach(), args.world_size)
-        reduced_dsc = reduce_tensor(dsc_loss.detach(), args.world_size)
-        torch.cuda.synchronize()
-        comm_time = time.time() - comm_start
+        if is_main_process(args):
+            timer.end_iter(fwd_time, bwd_time, opt_time)
 
-        compute_time_total += compute_time
-        comm_time_total += comm_time
+        bce_meter.update(bce_loss.item(), bsz)
+        dsc_meter.update(dsc_loss.item(), bsz)
+        loss_meter.update(loss.item(), bsz)
 
-        bce_meter.update(reduced_bce.item(), bsz)
-        dsc_meter.update(reduced_dsc.item(), bsz)
-        loss_meter.update(reduced_loss.item(), bsz)
-        comm_meter.update(comm_time, 1)
-
-        if is_main_process(args) and hasattr(pbar, 'set_postfix'):
+        if is_main_process(args):
             pbar.set_postfix(
                 Loss=f"{loss_meter.val:.4f}",
                 BCE=f"{bce_meter.val:.4f}",
                 Dice=f"{dsc_meter.val:.4f}",
-                Comm=f"{comm_meter.val:.3f}s",
             )
 
     if scheduler is not None:
         scheduler.step()
 
-    epoch_time = time.time() - epoch_start
-    gpu_throughput = num_samples / epoch_time
-    aggregate_throughput = (num_samples * args.world_size) / epoch_time
-    total_time = compute_time_total + comm_time_total
-    compute_ratio = (compute_time_total / total_time * 100) if total_time > 0 else 0
-    comm_ratio = (comm_time_total / total_time * 100) if total_time > 0 else 0
+    if is_main_process(args):
+        epoch_time, _ = timer.end_epoch()
+    else:
+        epoch_time = 0
+
+    gpu_throughput = num_samples / epoch_time if epoch_time > 0 else 0
+    aggregate_throughput = gpu_throughput * args.world_size
 
     _, peak_mem, _ = get_gpu_memory_mb()
 
@@ -230,13 +220,11 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
             f"Time      = {format_time(epoch_time)}, "
             f"GPU_Thrpt = {gpu_throughput:.2f} samp/s, "
             f"AggrThrpt = {aggregate_throughput:.2f} samp/s, "
-            f"Compute   = {compute_ratio:.1f}%, "
-            f"Comm      = {comm_ratio:.1f}%, "
-            f"CommTime  = {comm_time_total:.2f}s, "
             f"Peak_GPU  = {peak_mem:.0f}MB, "
         )
 
     if is_main_process(args) and writer is not None:
+        n = timer.epoch_iter_counts[-1]
         writer.add_scalar('train/bce_loss', bce_meter.avg, epoch)
         writer.add_scalar('train/dice_loss', dsc_meter.avg, epoch)
         writer.add_scalar('train/loss', loss_meter.avg, epoch)
@@ -244,14 +232,15 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
         writer.add_scalar('train/epoch_time_sec', epoch_time, epoch)
         writer.add_scalar('train/gpu_throughput_samples_per_sec', gpu_throughput, epoch)
         writer.add_scalar('train/aggregate_throughput_samples_per_sec', aggregate_throughput, epoch)
-        writer.add_scalar('train/compute_ratio_pct', compute_ratio, epoch)
-        writer.add_scalar('train/comm_ratio_pct', comm_ratio, epoch)
-        writer.add_scalar('train/comm_time_sec', comm_time_total, epoch)
         writer.add_scalar('train/peak_gpu_memory_mb', peak_mem, epoch)
+        writer.add_scalar('train/iter_fwd_median_ms', np.median(timer.iter_fwd_times[-n:]) * 1000, epoch)
+        writer.add_scalar('train/iter_bwd_median_ms', np.median(timer.iter_bwd_times[-n:]) * 1000, epoch)
+        writer.add_scalar('train/iter_opt_median_ms', np.median(timer.iter_opt_times[-n:]) * 1000, epoch)
+        writer.add_scalar('train/iter_total_median_ms', np.median(timer.iter_total_times[-n:]) * 1000, epoch)
 
     dist.barrier()
 
-    return loss_meter.avg, epoch_time, comm_time_total
+    return loss_meter.avg, epoch_time
 
 
 # ------------------------------------------------
@@ -317,9 +306,9 @@ def evaluate(args, epoch, model, infer_loader, loss_fn, writer, logger, mode='va
     all_hd95 = np.concatenate(all_hd95, axis=0)
 
     region_names = ['NETC', 'SNFH', 'ET', 'RC', 'TC', 'WT']
-    mean_dice = {f'Dice_{r}': all_dice[:, i].mean() for i, r in enumerate(region_names)}
-    mean_hd95 = {f'HD95_{r}': all_hd95[:, i].mean() for i, r in enumerate(region_names)}
-    std_dice = {f'Dice_{r}_std': all_dice[:, i].std() for i, r in enumerate(region_names)}
+    mean_dice = {f'Dice_{r}': float(all_dice[:, i].mean()) for i, r in enumerate(region_names)}
+    mean_hd95 = {f'HD95_{r}': float(all_hd95[:, i].mean()) for i, r in enumerate(region_names)}
+    std_dice = {f'Dice_{r}_std': float(all_dice[:, i].std()) for i, r in enumerate(region_names)}
     infer_metrics = {**mean_dice, **mean_hd95}
 
     logger.info(
@@ -354,20 +343,24 @@ def main():
 
     setup_multigpu_ddp(args)
 
+    torch.backends.cudnn.benchmark = True
+
     global_batch_size = args.batch_size * args.world_size
 
     logger, writer = initialization(args)
 
+    timer = TimerCollector() if is_main_process(args) else None
+
     if is_main_process(args):
         logger.info("—" * 60)
-        logger.info("EXPERIMENT CONFIGURATION (MULTI-GPU DDP)".center(60))
+        logger.info("EXPERIMENT CONFIGURATION MULTI-GPU DDP".center(60))
         logger.info("—" * 60)
         logger.info(f"Model           : {args.unet_arch} ({args.block} block)")
         logger.info(f"Channels        : {args.channels_list}")
         logger.info(f"Patch size      : {args.patch_size}")
         logger.info(f"Batch size/GPU  : {args.batch_size}")
         logger.info(f"Global batch    : {global_batch_size}")
-        logger.info(f"Scaling mode    : Strong (fixed global batch size)")
+        logger.info(f"Scaling mode    : Strong Scaling")
         logger.info(f"Epochs          : {args.epochs}")
         logger.info(f"Optimizer       : {args.optim} (lr={args.lr}, wd={args.weight_decay})")
         logger.info(f"Scheduler       : {args.scheduler}")
@@ -383,7 +376,6 @@ def main():
     split = load_split(args.split_file)
     train_loader, train_sampler = get_train_loader(args, split['train'], distributed=True)
 
-    # Val and test loaders only needed on rank 0
     if is_main_process(args):
         val_loader, _ = get_infer_loader(args, split['val'], distributed=False)
         test_loader, _ = get_infer_loader(args, split['test'], distributed=False)
@@ -419,6 +411,8 @@ def main():
         output_device=args.local_rank,
         gradient_as_bucket_view=True,
         broadcast_buffers=True,
+        find_unused_parameters=False,
+        static_graph=True,
     )
 
     optimizer = get_optimizer(args, model)
@@ -443,47 +437,41 @@ def main():
     best_epoch = 0
     best_dice = 0.0
     best_model = None
-    epoch_times = []
-    comm_times = []
     total_train_start = time.time()
 
-    # Template for non-main GPUs to participate in broadcast_dict
-    _empty_val_metrics = {
-        'Dice_NETC': 0.0, 'Dice_SNFH': 0.0, 'Dice_ET': 0.0,
-        'Dice_RC': 0.0, 'Dice_TC': 0.0, 'Dice_WT': 0.0,
-        'HD95_NETC': 0.0, 'HD95_SNFH': 0.0, 'HD95_ET': 0.0,
-        'HD95_RC': 0.0, 'HD95_TC': 0.0, 'HD95_WT': 0.0,
-    }
-
     for epoch in range(args.epochs):
-        train_loss, epoch_time, comm_time = train(
+        train_loss, epoch_time = train(
             args, epoch, model, train_loader, train_sampler, loss_fn,
-            optimizer, scheduler, scaler, writer, logger
+            optimizer, scheduler, scaler, writer, logger, timer
         )
-        epoch_times.append(epoch_time)
-        comm_times.append(comm_time)
 
         if (epoch + 1) % args.eval_freq == 0:
-            # Only rank 0 runs evaluation; others get empty dict
+            if is_main_process(args):
+                timer.start_val()
+
             val_metrics = evaluate(
                 args, epoch, model, val_loader, loss_fn, writer, logger, mode='val'
             )
 
-            # All GPUs sync here while rank 0 finishes eval
+            if is_main_process(args):
+                timer.end_val(epoch)
+
             dist.barrier()
 
-            # Non-main GPUs need matching keys for broadcast
-            if not is_main_process(args):
-                val_metrics = _empty_val_metrics.copy()
-
-            # Broadcast real metrics from rank 0 to all GPUs
-            val_metrics = broadcast_dict(val_metrics, src=0, device=f'cuda:{args.local_rank}')
+            obj_list = [val_metrics] if is_main_process(args) else [None]
+            dist.broadcast_object_list(
+                obj_list,
+                src=0,
+                device=torch.device(f'cuda:{args.local_rank}')
+            )
+            val_metrics = obj_list[0]
 
             mean_dice = np.mean([
                 val_metrics['Dice_ET'],
                 val_metrics['Dice_TC'],
                 val_metrics['Dice_WT']
             ])
+
             if mean_dice > best_dice:
                 best_dice = mean_dice
                 best_epoch = epoch
@@ -497,21 +485,26 @@ def main():
 
     if is_main_process(args):
         _, peak_mem, _ = get_gpu_memory_mb()
-        avg_epoch_time = np.mean(epoch_times) if epoch_times else 0
-        avg_comm_time = np.mean(comm_times) if comm_times else 0
-        total_comm_time = sum(comm_times)
-        comm_pct = (total_comm_time / total_train_time * 100) if total_train_time > 0 else 0
+
+        total_wallclock = total_train_time
+        total_train_times = sum(timer.epoch_times)
+        total_val_times = sum(timer.val_times)
+        train_fraction = (total_train_times / total_wallclock * 100) if total_wallclock > 0 else 0
+
+        avg_epoch_time = np.mean(timer.epoch_times) if timer.epoch_times else 0
+        median_epoch_time = np.median(timer.epoch_times) if timer.epoch_times else 0
 
         logger.info("—" * 60)
-        logger.info("TRAINING SUMMARY (MULTI-GPU DDP)".center(60))
+        logger.info("TRAINING SUMMARY".center(60))
         logger.info("—" * 60)
-        logger.info(f"Total training time      : {format_time(total_train_time)}")
+        logger.info(f"Total wallclock          : {format_time(total_wallclock)}")
+        logger.info(f"Train time               : {format_time(total_train_times)}")
+        logger.info(f"Val time                 : {format_time(total_val_times)}")
+        logger.info(f"Train fraction           : {train_fraction:.1f}%")
         logger.info(f"Avg epoch time           : {format_time(avg_epoch_time)}")
-        logger.info(f"Median epoch time        : {format_time(np.median(epoch_times))}")
-        logger.info(f"Min epoch time           : {format_time(min(epoch_times))}")
-        logger.info(f"Max epoch time           : {format_time(max(epoch_times))}")
-        logger.info(f"Total communication time : {format_time(total_comm_time)} ({comm_pct:.1f}% of total)")
-        logger.info(f"Avg comm time per epoch  : {avg_comm_time:.2f}s")
+        logger.info(f"Median epoch time        : {format_time(median_epoch_time)}")
+        logger.info(f"Min epoch time           : {format_time(min(timer.epoch_times))}")
+        logger.info(f"Max epoch time           : {format_time(max(timer.epoch_times))}")
         logger.info(f"Peak GPU memory          : {peak_mem:.0f} MB")
         logger.info(f"Best epoch               : {best_epoch}")
         logger.info(f"Best mean Dice           : {best_dice:.4f}")
@@ -540,14 +533,13 @@ def main():
                 {
                     'hparam/best_dice': best_dice,
                     'hparam/best_epoch': best_epoch,
-                    'hparam/total_train_time_sec': total_train_time,
-                    'hparam/total_comm_time_sec': total_comm_time,
-                    'hparam/comm_pct': comm_pct,
+                    'hparam/total_wallclock': total_wallclock,
+                    'hparam/total_train_times': total_train_times,
+                    'hparam/total_val_times': total_val_times,
                     'hparam/peak_gpu_memory_mb': peak_mem,
                 }
             )
 
-    # Final test — only rank 0, other GPUs wait at cleanup_ddp's barrier
     if is_main_process(args) and best_model is not None:
         logger.info(f"Testing best model from epoch [{best_epoch}] (mean Dice {best_dice:.4f})")
         model.module.load_state_dict(best_model)
@@ -565,9 +557,9 @@ def main():
                 'metrics': {
                     'best_dice': best_dice,
                     'test_metrics': test_metrics,
-                    'total_train_time': total_train_time,
-                    'total_comm_time': sum(comm_times),
-                    'comm_pct': (sum(comm_times) / total_train_time * 100) if total_train_time > 0 else 0,
+                    'total_wallclock': total_wallclock,
+                    'total_train_times': total_train_times,
+                    'total_val_times': total_val_times,
                     'peak_gpu_memory_mb': peak_mem,
                     'num_gpus': args.world_size,
                     'global_batch_size': global_batch_size,
@@ -578,8 +570,12 @@ def main():
     elif is_main_process(args):
         logger.warning("No best model found (no evaluation was run). Check eval_freq setting.")
 
-    if is_main_process(args) and writer is not None:
-        writer.close()
+    if is_main_process(args):
+        timer_path = os.path.join(args.exp_dir, "timer.npz")
+        timer.save(timer_path)
+        logger.info(f"Saved raw timing data to {timer_path}")
+        if writer is not None:
+            writer.close()
 
     cleanup_ddp()
 
