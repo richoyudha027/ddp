@@ -68,6 +68,7 @@ def setup_multigpu_ddp(args):
     dist.init_process_group(
         backend=args.dist_backend,
         init_method='env://',
+        timeout=timedelta(hours=2)
     )
 
     torch.cuda.set_device(args.local_rank)
@@ -157,7 +158,7 @@ def train(args, epoch, model, train_loader, train_sampler, loss_fn,
         # Backward
         if is_main_process(args):
             timer.start_bwd()
-            
+
         optimizer.zero_grad()
         if args.amp and scaler is not None:
             scaler.scale(loss).backward()
