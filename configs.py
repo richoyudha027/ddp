@@ -11,7 +11,7 @@ def parse_seg_args():
     parser.add_argument('--num_workers', type=int, default=6, help='number of workers to load data')
     parser.add_argument('--amp', action='store_true', help='using mixed precision')
 
-    #split
+    # split
     parser.add_argument('--split_file', type=str, required=True, help='path to json file that contains data split info')
     
     # ddp (multi-gpu support)
@@ -58,6 +58,12 @@ def parse_seg_args():
         help='decay factor for multistep decay')
     parser.add_argument('--clip_grad', action='store_true', help='whether to clip gradient')
 
+    parser.add_argument('--model', type=str, default='unet',
+        choices=['unet', 'swin_unetr'],
+        help='Top-level model architecture. Used for exp_dir naming and (if you wish) '
+             'to dispatch model building. The trainer scripts (train_ddp_unet.py / '
+             'train_ddp_swin.py) hardcode their model, so this flag mainly tags exp_dir.')
+
     # u-net
     parser.add_argument('--unet_arch', type=str, default='unet', 
         choices=['unet', 'multiencoder_unet'], help='Architecuture of the U-Net')
@@ -77,6 +83,21 @@ def parse_seg_args():
     parser.add_argument('--ds_layer', type=int, default=4, 
         help='last n layer to use deep supervision')
 
+    # swin unetr
+    parser.add_argument('--swin_feature_size', type=int, default=48)
+    parser.add_argument('--swin_use_checkpoint',
+        action='store_true', default=True,
+        help='use gradient checkpointing in Swin UNETR (default: True). '
+             'Pass --no_swin_use_checkpoint to disable.')
+    parser.add_argument('--no_swin_use_checkpoint',
+        dest='swin_use_checkpoint', action='store_false',
+        help='disable gradient checkpointing in Swin UNETR')
+    parser.add_argument('--swin_depths', type=int, nargs='+', default=[2, 2, 2, 2])
+    parser.add_argument('--swin_num_heads', type=int, nargs='+', default=[3, 6, 12, 24])
+    parser.add_argument('--swin_drop_rate', type=float, default=0.0)
+    parser.add_argument('--swin_attn_drop_rate', type=float, default=0.0)
+    parser.add_argument('--swin_dropout_path_rate', type=float, default=0.0)
+
     # eval
     parser.add_argument('--save_model', action='store_true', default=False, 
         help='whether save model state')
@@ -92,18 +113,27 @@ def parse_seg_args():
 
     args = parser.parse_args()
 
-    # generate save path
+
+    if args.model == 'swin_unetr':
+        model_tag = f"swin_fs{args.swin_feature_size}"
+        if not args.swin_use_checkpoint:
+            model_tag += "_nockpt"
+    else:
+        model_tag = f"{args.unet_arch}_{args.block}"
+
     exp_dir_name = [
-        args.comment, 
+        args.comment,
         args.dataset,
-        args.unet_arch,
+        model_tag,
         args.optim,
         args.scheduler,
+        f"bs{args.batch_size}",
+        f"ps{args.patch_size}",
         f"pos{args.pos_ratio}",
         f"neg{args.neg_ratio}",
     ]
     exp_dir_name.append(time.strftime("%m%d_%H%M%S", time.localtime()))
-    exp_dir_name = "_".join(exp_dir_name)
-    args.exp_dir += exp_dir_name
+    exp_dir_name = "_".join([s for s in exp_dir_name if s])
+    args.exp_dir = os.path.join(args.exp_dir, exp_dir_name)
 
     return args
