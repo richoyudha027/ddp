@@ -70,7 +70,8 @@ def setup_multigpu_ddp(args):
     dist.init_process_group(
         backend=args.dist_backend,
         init_method='env://',
-        timeout=timedelta(hours=2)
+        timeout=timedelta(hours=2),
+        device_id=torch.device(f'cuda:{args.local_rank}')
     )
 
     torch.cuda.set_device(args.local_rank)
