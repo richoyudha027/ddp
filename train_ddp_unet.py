@@ -415,8 +415,8 @@ def main():
         output_device=args.local_rank,
         gradient_as_bucket_view=True,
         broadcast_buffers=True,
-        find_unused_parameters=True,
-        static_graph=False,
+        find_unused_parameters=False,
+        static_graph=True,
     )
 
     optimizer = get_optimizer(args, model)
