@@ -1,40 +1,3 @@
-"""
-extract_hd95_std.py
--------------------
-Inference-only script untuk ekstrak HD95 per-kasus dari best_model_Xgpu.pth
-dan menyimpan array per-kasus + SD ke hd95_per_case_Xgpu.npz.
-
-Struktur checkpoint:
-    weights/best_model_1gpu.pth
-    weights/best_model_2gpu.pth
-    weights/best_model_4gpu.pth
-
-Usage:
-    python extract_hd95_std.py --num_gpus 1 --weights_dir /ddp/weights \
-        --split_file /ddp/data/split.json --mode val
-
-    # Jalankan untuk semua konfigurasi sekaligus:
-    for N in 1 2 4; do
-        python extract_hd95_std.py --num_gpus $N \
-            --weights_dir /ddp/weights \
-            --split_file /ddp/data/split.json \
-            --mode val
-    done
-
-Output (disimpan di weights_dir):
-    hd95_per_case_1gpu.npz
-    hd95_per_case_2gpu.npz
-    hd95_per_case_4gpu.npz
-
-    Setiap file berisi:
-        hd95_per_case : (N_cases, 6) — HD95 per kasus per region
-        hd95_mean     : (6,)         — mean per region
-        hd95_std      : (6,)         — std per region
-        region_names  : (6,)         — ['NETC','SNFH','ET','RC','TC','WT']
-        mode          : str          — 'val' atau 'test'
-        num_gpus      : int          — konfigurasi GPU
-"""
-
 import os
 import argparse
 import warnings
@@ -104,7 +67,7 @@ def main():
     parser.add_argument('--num_gpus',    type=int, required=True,
                         choices=[1, 2, 4],
                         help='Konfigurasi GPU checkpoint yang akan di-load')
-    parser.add_argument('--mode',        type=str, default='val',
+    parser.add_argument('--eval_split',  type=str, default='val',
                         choices=['val', 'test'],
                         help='Evaluasi pada val set atau test set (default: val)')
 
@@ -142,13 +105,13 @@ def main():
 
     # ── Load split dan build dataloader ───────────────────────────────────────
     split = load_split(args.split_file)
-    file_paths = split[args.mode]   # list of .npz paths untuk val atau test
+    file_paths = split[args.eval_split]   # list of .npz paths untuk val atau test
 
     # get_infer_loader menerima (args, file_paths, distributed=False)
     # distributed=False karena ini single-GPU inference
     infer_loader, _ = get_infer_loader(args, file_paths, distributed=False)
 
-    print(f"\nDataset    : {args.mode} set — {len(file_paths)} kasus")
+    print(f"\nDataset    : {args.eval_split} set — {len(file_paths)} kasus")
     print(f"patch_size : {args.patch_size}")
     print(f"sw_batch   : {args.sw_batch_size}")
     print(f"sw_mode    : {args.sliding_window_mode}\n")
@@ -175,7 +138,7 @@ def main():
         hd95_mean     = hd95_mean,
         hd95_std      = hd95_std,
         region_names  = np.array(REGION_NAMES),
-        mode          = np.array(args.mode),
+        mode          = np.array(args.eval_split),
         num_gpus      = np.array(args.num_gpus),
     )
     print(f"\nSaved: {out_path}")
