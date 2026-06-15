@@ -83,8 +83,8 @@ def get_swin_unetr(args):
         dropout_path_rate=dropout_path_rate,
         use_checkpoint=use_checkpoint,
         spatial_dims=3,
-        downsample="merging",   # eksplisit V1, bukan mergingv2
-        use_v2=False,           # eksplisit V1
+        downsample="merging",
+        use_v2=False, 
     )
     return model
 
