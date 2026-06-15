@@ -65,7 +65,6 @@ def get_swin_unetr(args):
     drop_rate = getattr(args, 'swin_drop_rate', 0.0)
     attn_drop_rate = getattr(args, 'swin_attn_drop_rate', 0.0)
     dropout_path_rate = getattr(args, 'swin_dropout_path_rate', 0.0)
-    spatial_dims = 3
 
     assert args.patch_size % 32 == 0, (
         f"Swin UNETR requires patch_size divisible by 32, got {args.patch_size}. "
@@ -73,17 +72,19 @@ def get_swin_unetr(args):
     )
 
     model = SwinUNETR(
-        img_size=(args.patch_size,) * 3,
         in_channels=4,
         out_channels=4,
         feature_size=feature_size,
         depths=depths,
         num_heads=num_heads,
+        norm_name="instance",
         drop_rate=drop_rate,
         attn_drop_rate=attn_drop_rate,
         dropout_path_rate=dropout_path_rate,
         use_checkpoint=use_checkpoint,
-        spatial_dims=spatial_dims,
+        spatial_dims=3,
+        downsample="merging",   # eksplisit V1, bukan mergingv2
+        use_v2=False,           # eksplisit V1
     )
     return model
 
