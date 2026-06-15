@@ -2,3 +2,6 @@
 venv/
 
 __pycache__/
+
+data/data_split_sample.json
+data/data_split.json
