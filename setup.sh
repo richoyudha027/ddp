@@ -35,7 +35,8 @@ from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id='yuuricho/brats_preprocessing',
     repo_type='dataset',
-    local_dir='datasets'
+    local_dir='datasets',
+    token='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'
 )
 "
 
