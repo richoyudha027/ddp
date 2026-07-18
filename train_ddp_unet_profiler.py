@@ -298,8 +298,10 @@ def train_profile(args, model, train_loader, train_sampler,
         barrier_ms = t16.elapsed_time(t17)
 
         # AllReduce timing untuk iterasi ini
+        # Di 1 GPU: paksa 0 karena tidak ada komunikasi antar GPU
+        # Nilai ~0.55ms yang muncul di 1 GPU adalah hook overhead, bukan AllReduce
         ar_ms = 0.0
-        if ar_timer and is_active and len(ar_timer.iter_allreduce_ms) > 0:
+        if args.world_size > 1 and ar_timer and is_active and len(ar_timer.iter_allreduce_ms) > 0:
             ar_ms = ar_timer.iter_allreduce_ms[-1]
 
         # Gradient compute = backward total - AllReduce
