@@ -82,7 +82,9 @@ class AllReduceTimer:
             t_end.record()
             if self._active:
                 self._iter_buckets.append((t_start, t_end))
-            return fut.value()
+            result = fut.value()
+            # DDP mengharapkan Tensor, bukan list
+            return result[0] if isinstance(result, list) else result
 
         return fut.then(callback)
 
