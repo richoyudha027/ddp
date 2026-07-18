@@ -1,5 +1,4 @@
 import os
-import json
 import warnings
 from datetime import timedelta
 
@@ -350,9 +349,6 @@ def train_profile(args, model, train_loader, train_sampler,
 
     # ── Simpan & Cetak Summary ─────────────────────────────────────────
     if is_main_process(args) and timing_records:
-        timing_path = os.path.join(output_dir, "timing_breakdown.json")
-        with open(timing_path, 'w') as f:
-            json.dump(timing_records, f, indent=2)
 
         # Arrays per komponen
         dt_arr      = np.array([r["data_transfer_ms"]  for r in timing_records])
@@ -367,11 +363,30 @@ def train_profile(args, model, train_loader, train_sampler,
         bar_arr     = np.array([r["barrier_ms"]         for r in timing_records])
         tot_arr     = np.array([r["total_ms"]           for r in timing_records])
 
+        # Simpan ke .npz — konsisten dengan timer.npz dari training
+        timing_path = os.path.join(output_dir, "profiler_timing.npz")
+        np.savez(
+            timing_path,
+            data_transfer_ms  = dt_arr,
+            forward_ms        = fwd_arr,
+            zero_grad_ms      = zg_arr,
+            grad_compute_ms   = gc_arr,
+            amp_unscale_ms    = us_arr,
+            grad_clip_ms      = clip_arr,
+            optimizer_ms      = opt_arr,
+            scaler_update_ms  = su_arr,
+            allreduce_ms      = ar_arr,
+            barrier_ms        = bar_arr,
+            total_ms          = tot_arr,
+        )
+        print(f"\n[PROFILER] Saved: {timing_path}")
+
         # Serial fraction = AllReduce + barrier
         serial_ms   = ar_arr + bar_arr
         parallel_ms = tot_arr - serial_ms
-        f_val       = parallel_ms.mean() / tot_arr.mean()
-        s_val       = serial_ms.mean()   / tot_arr.mean()
+        # Gunakan median untuk robustness terhadap outlier infrastruktur
+        f_val       = np.median(parallel_ms) / np.median(tot_arr)
+        s_val       = np.median(serial_ms)   / np.median(tot_arr)
 
         print("\n" + "=" * 70)
         print(f"TIMING BREAKDOWN — {args.world_size} GPU".center(70))
@@ -400,10 +415,11 @@ def train_profile(args, model, train_loader, train_sampler,
         print("-" * 70)
         print(f"{'TOTAL':<25} {'':<10} {tot_arr.mean():>9.2f} {np.median(tot_arr):>10.2f} {'100.00':>7}%")
         print("=" * 70)
-        print(f"\nParallel fraction (f) = {f_val:.6f}  ({f_val*100:.4f}%)")
+        print(f"\n[Menggunakan median untuk robustness terhadap outlier]")
+        print(f"Parallel fraction (f) = {f_val:.6f}  ({f_val*100:.4f}%)")
         print(f"Serial fraction   (s) = {s_val:.6f}  ({s_val*100:.4f}%)")
-        print(f"  - allreduce_nccl    = {ar_arr.mean():.2f}ms  ({ar_arr.mean()/tot_arr.mean()*100:.4f}%)")
-        print(f"  - dist_barrier      = {bar_arr.mean():.2f}ms  ({bar_arr.mean()/tot_arr.mean()*100:.4f}%)")
+        print(f"  - allreduce_nccl    = {np.median(ar_arr):.2f}ms  ({np.median(ar_arr)/np.median(tot_arr)*100:.4f}%)")
+        print(f"  - dist_barrier      = {np.median(bar_arr):.2f}ms  ({np.median(bar_arr)/np.median(tot_arr)*100:.4f}%)")
 
         if s_val > 0:
             s_max = 1.0 / s_val
@@ -418,7 +434,6 @@ def train_profile(args, model, train_loader, train_sampler,
             print(f"[NOTE] Jalankan 2 GPU dan 4 GPU untuk mendapat serial fraction")
 
         print("=" * 70)
-        print(f"\nSaved: {timing_path}")
 
 
 # ------------------------------------------------
