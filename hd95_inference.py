@@ -19,10 +19,6 @@ REGION_NAMES = ['NETC', 'SNFH', 'ET', 'RC', 'TC', 'WT']
 
 @torch.no_grad()
 def run_inference(model, dataloader, args):
-    """
-    Sliding window inference dan kumpulkan HD95 per kasus.
-    Returns: all_hd95 — numpy array (N_cases, 6)
-    """
     model.eval()
     all_hd95 = []
     n = len(dataloader)
@@ -42,11 +38,9 @@ def run_inference(model, dataloader, args):
 
         seg_map = (torch.sigmoid(seg_map) > 0.5).float()
 
-        # Expand 4-channel ke 6-channel eval regions
         seg_6   = compute_eval_regions(seg_map)
         label_6 = compute_eval_regions(label)
 
-        # HD95 per kasus: returns (B, C) numpy array, B=1 karena infer_batch_size=1
         hd = metrics.hd95(seg_6, label_6)
         all_hd95.append(hd)
 
@@ -57,11 +51,8 @@ def run_inference(model, dataloader, args):
 
 
 def main():
-    # Pakai parent parser dari configs.py agar patch_size, sw_batch_size, dll
-    # konsisten dengan config training
     parser = argparse.ArgumentParser(parents=[parse_seg_args()], add_help=False)
 
-    # Args tambahan khusus script ini
     parser.add_argument('--weights_dir', type=str, required=True,
                         help='Folder berisi best_model_Xgpu.pth')
     parser.add_argument('--num_gpus',    type=int, required=True,
@@ -73,14 +64,14 @@ def main():
 
     args = parser.parse_args()
 
-    # ── Load checkpoint ────────────────────────────────────────────────────────
+    # Load checkpoint
     ckpt_path = os.path.join(args.weights_dir, f'best_model_{args.num_gpus}gpu.pth')
     assert os.path.exists(ckpt_path), f"Checkpoint tidak ditemukan: {ckpt_path}"
 
     print(f"\nLoading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu')
 
-    # Override args dengan args dari checkpoint untuk konsistensi penuh
+    # Override args dengan args dari checkpoint
     if 'args' in ckpt:
         saved = ckpt['args']
         for attr in ['patch_size', 'sw_batch_size', 'patch_overlap',
@@ -94,8 +85,7 @@ def main():
     else:
         print("  WARNING: 'args' tidak ditemukan di checkpoint — pakai args CLI.")
 
-    # ── Build model ────────────────────────────────────────────────────────────
-    # Nonaktifkan deep supervision untuk inference
+    # Build model
     args.deep_supervision = False
 
     model = get_unet(args).cuda()
@@ -103,12 +93,10 @@ def main():
     model.eval()
     print(f"  Model: {args.unet_arch}, deep_supervision=False")
 
-    # ── Load split dan build dataloader ───────────────────────────────────────
+    # Load split dan build dataloader
     split = load_split(args.split_file)
-    file_paths = split[args.eval_split]   # list of .npz paths untuk val atau test
+    file_paths = split[args.eval_split]
 
-    # get_infer_loader menerima (args, file_paths, distributed=False)
-    # distributed=False karena ini single-GPU inference
     infer_loader, _ = get_infer_loader(args, file_paths, distributed=False)
 
     print(f"\nDataset    : {args.eval_split} set — {len(file_paths)} kasus")
@@ -116,10 +104,8 @@ def main():
     print(f"sw_batch   : {args.sw_batch_size}")
     print(f"sw_mode    : {args.sliding_window_mode}\n")
 
-    # ── Inference ──────────────────────────────────────────────────────────────
     all_hd95 = run_inference(model, infer_loader, args)   # (N_cases, 6)
 
-    # ── Hitung statistik ──────────────────────────────────────────────────────
     hd95_mean = all_hd95.mean(axis=0)   # (6,)
     hd95_std  = all_hd95.std(axis=0)    # (6,)
 
@@ -129,7 +115,6 @@ def main():
     for i, r in enumerate(REGION_NAMES):
         print(f"{r:<8} {hd95_mean[i]:>8.2f} {hd95_std[i]:>8.2f}")
 
-    # ── Simpan ─────────────────────────────────────────────────────────────────
     out_path = os.path.join(args.weights_dir,
                             f'hd95_per_case_{args.num_gpus}gpu.npz')
     np.savez(

@@ -32,7 +32,6 @@ TOTAL_ITERS    = PROFILE_WARMUP + PROFILE_ITERS
 # ------------------------------------------------
 
 def cuda_time(fn):
-    """Jalankan fn(), return durasi dalam ms via CUDA event."""
     t0 = torch.cuda.Event(enable_timing=True)
     t1 = torch.cuda.Event(enable_timing=True)
     t0.record()
@@ -41,13 +40,6 @@ def cuda_time(fn):
     t1.record()
     torch.cuda.synchronize()
     return t0.elapsed_time(t1)
-
-
-# ------------------------------------------------
-#  AllReduce Timer Hook
-#  Inject langsung ke DDP communication pipeline.
-#  Timing aktual AllReduce NCCL per bucket per iterasi.
-# ------------------------------------------------
 
 class AllReduceTimer:
     def __init__(self):
@@ -82,7 +74,6 @@ class AllReduceTimer:
             if self._active:
                 self._iter_buckets.append((t_start, t_end))
             result = fut.value()
-            # DDP mengharapkan Tensor, bukan list
             return result[0] if isinstance(result, list) else result
 
         return fut.then(callback)
@@ -150,7 +141,6 @@ def train_profile(args, model, train_loader, train_sampler,
         if i >= TOTAL_ITERS:
             break
 
-        # Aktifkan AllReduce timer setelah warmup
         if i == PROFILE_WARMUP:
             torch.cuda.synchronize()
             if ar_timer:
@@ -161,10 +151,7 @@ def train_profile(args, model, train_loader, train_sampler,
         is_active = (i >= PROFILE_WARMUP)
         image_cpu, label_cpu = batch[0], batch[1]
 
-        # ── 1. Data Transfer H2D ───────────────────────────────────────
-        # non_blocking=True → transfer async, overlap dengan komputasi
-        # synchronize() memastikan transfer selesai sebelum komputasi
-        # Tipe: PARALEL (independent per rank, tidak ada komunikasi antar GPU)
+        # 1. Data Transfer H2D
         t0 = torch.cuda.Event(enable_timing=True)
         t1 = torch.cuda.Event(enable_timing=True)
         t0.record()
@@ -177,11 +164,7 @@ def train_profile(args, model, train_loader, train_sampler,
 
         bsz = image.size(0)
 
-        # ── 2. Forward Pass ────────────────────────────────────────────
-        # Termasuk: seluruh 3D U-Net (encoder conv3d, instance norm,
-        # leaky relu, decoder convtranspose3d, deep supervision heads)
-        # + loss computation (BCE + Soft Dice)
-        # Tipe: PARALEL (setiap rank forward pass independent)
+        # 2. Forward Pass
         t2 = torch.cuda.Event(enable_timing=True)
         t3 = torch.cuda.Event(enable_timing=True)
         t2.record()
@@ -194,9 +177,7 @@ def train_profile(args, model, train_loader, train_sampler,
         torch.cuda.synchronize()
         fwd_ms = t2.elapsed_time(t3)
 
-        # ── 3. zero_grad ───────────────────────────────────────────────
-        # Reset gradient buffer sebelum backward
-        # Tipe: PARALEL (per rank, tidak ada komunikasi)
+        # 3. zero_grad
         t4 = torch.cuda.Event(enable_timing=True)
         t5 = torch.cuda.Event(enable_timing=True)
         t4.record()
@@ -206,14 +187,7 @@ def train_profile(args, model, train_loader, train_sampler,
         torch.cuda.synchronize()
         zero_grad_ms = t4.elapsed_time(t5)
 
-        # ── 4. Backward Pass (gradient compute) ───────────────────────
-        # Gradient computation berjalan paralel di setiap rank.
-        # DDP hook AllReduce di-overlap dengan backward per bucket —
-        # artinya AllReduce bucket i berjalan bersamaan dengan
-        # gradient computation layer i-1.
-        # backward_ms = grad_compute_ms + allreduce_ms (overlap sebagian)
-        # Isolasi AllReduce dilakukan via AllReduceTimer hook.
-        # Tipe: CAMPURAN (grad compute=PARALEL, AllReduce=SERIAL)
+        # 4. Backward Pass (gradient compute)
         t6 = torch.cuda.Event(enable_timing=True)
         t7 = torch.cuda.Event(enable_timing=True)
         t6.record()
@@ -221,18 +195,15 @@ def train_profile(args, model, train_loader, train_sampler,
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        torch.cuda.synchronize()  # tunggu AllReduce selesai
+        torch.cuda.synchronize()
         t7.record()
         torch.cuda.synchronize()
         bwd_ms = t6.elapsed_time(t7)
 
-        # Finalize AllReduce timing untuk iterasi ini
         if ar_timer:
             ar_timer.flush_iter()
 
-        # ── 5. Gradient Unscale (AMP) ──────────────────────────────────
-        # Kembalikan gradient ke FP32 scale sebelum clipping
-        # Tipe: PARALEL (per rank, tidak ada komunikasi)
+        # 5. Gradient Unscale (AMP)
         t8 = torch.cuda.Event(enable_timing=True)
         t9 = torch.cuda.Event(enable_timing=True)
         t8.record()
@@ -243,9 +214,7 @@ def train_profile(args, model, train_loader, train_sampler,
         torch.cuda.synchronize()
         unscale_ms = t8.elapsed_time(t9)
 
-        # ── 6. Gradient Clipping ───────────────────────────────────────
-        # Clip gradient norm untuk stabilitas training
-        # Tipe: PARALEL (per rank, gradient sudah di-average via AllReduce)
+        # 6. Gradient Clipping
         t10 = torch.cuda.Event(enable_timing=True)
         t11 = torch.cuda.Event(enable_timing=True)
         t10.record()
@@ -256,9 +225,7 @@ def train_profile(args, model, train_loader, train_sampler,
         torch.cuda.synchronize()
         clip_ms = t10.elapsed_time(t11)
 
-        # ── 7. Optimizer Step ──────────────────────────────────────────
-        # Update parameter berdasarkan gradient yang sudah di-average
-        # Tipe: PARALEL (per rank, identik di semua rank karena gradient sama)
+        # 7. Optimizer Step
         t12 = torch.cuda.Event(enable_timing=True)
         t13 = torch.cuda.Event(enable_timing=True)
         t12.record()
@@ -271,9 +238,7 @@ def train_profile(args, model, train_loader, train_sampler,
         torch.cuda.synchronize()
         opt_ms = t12.elapsed_time(t13)
 
-        # ── 8. AMP Scaler Update ───────────────────────────────────────
-        # Update loss scale factor untuk iterasi berikutnya
-        # Tipe: PARALEL (per rank)
+        # 8. AMP Scaler Update
         t14 = torch.cuda.Event(enable_timing=True)
         t15 = torch.cuda.Event(enable_timing=True)
         t14.record()
@@ -284,9 +249,7 @@ def train_profile(args, model, train_loader, train_sampler,
         torch.cuda.synchronize()
         scaler_update_ms = t14.elapsed_time(t15)
 
-        # ── 9. dist.barrier() ──────────────────────────────────────────
-        # Sinkronisasi global — semua rank harus selesai sebelum lanjut
-        # Tipe: SERIAL (blocking, semua rank harus wait)
+        # 9. dist.barrier()
         t16 = torch.cuda.Event(enable_timing=True)
         t17 = torch.cuda.Event(enable_timing=True)
         t16.record()
@@ -296,15 +259,10 @@ def train_profile(args, model, train_loader, train_sampler,
         torch.cuda.synchronize()
         barrier_ms = t16.elapsed_time(t17)
 
-        # AllReduce timing untuk iterasi ini
-        # Di 1 GPU: paksa 0 karena tidak ada komunikasi antar GPU
-        # Nilai ~0.55ms yang muncul di 1 GPU adalah hook overhead, bukan AllReduce
+        # AllReduce timing
         ar_ms = 0.0
         if args.world_size > 1 and ar_timer and is_active and len(ar_timer.iter_allreduce_ms) > 0:
             ar_ms = ar_timer.iter_allreduce_ms[-1]
-
-        # Gradient compute = backward total - AllReduce
-        # (karena AllReduce overlap dengan backward di DDP)
         grad_compute_ms = max(bwd_ms - ar_ms, 0.0)
 
         total_ms = (dt_h2d_ms + fwd_ms + zero_grad_ms +
@@ -314,7 +272,6 @@ def train_profile(args, model, train_loader, train_sampler,
         if is_active:
             timing_records.append({
                 "iter":              i,
-                # ── PARALEL ──────────────────────────────────────
                 "data_transfer_ms":  round(dt_h2d_ms,        3),
                 "forward_ms":        round(fwd_ms,            3),
                 "zero_grad_ms":      round(zero_grad_ms,      3),
@@ -323,10 +280,8 @@ def train_profile(args, model, train_loader, train_sampler,
                 "grad_clip_ms":      round(clip_ms,           3),
                 "optimizer_ms":      round(opt_ms,            3),
                 "scaler_update_ms":  round(scaler_update_ms,  3),
-                # ── SERIAL ───────────────────────────────────────
                 "allreduce_ms":      round(ar_ms,             3),
                 "barrier_ms":        round(barrier_ms,        3),
-                # ── RAW ──────────────────────────────────────────
                 "backward_raw_ms":   round(bwd_ms,            3),
                 "total_ms":          round(total_ms,          3),
             })
@@ -347,10 +302,7 @@ def train_profile(args, model, train_loader, train_sampler,
     if ar_timer:
         ar_timer.deactivate()
 
-    # ── Simpan & Cetak Summary ─────────────────────────────────────────
     if is_main_process(args) and timing_records:
-
-        # Arrays per komponen
         dt_arr      = np.array([r["data_transfer_ms"]  for r in timing_records])
         fwd_arr     = np.array([r["forward_ms"]         for r in timing_records])
         zg_arr      = np.array([r["zero_grad_ms"]       for r in timing_records])
@@ -363,7 +315,6 @@ def train_profile(args, model, train_loader, train_sampler,
         bar_arr     = np.array([r["barrier_ms"]         for r in timing_records])
         tot_arr     = np.array([r["total_ms"]           for r in timing_records])
 
-        # Simpan ke .npz — konsisten dengan timer.npz dari training
         timing_path = os.path.join(output_dir, "profiler_timing.npz")
         np.savez(
             timing_path,
@@ -381,10 +332,9 @@ def train_profile(args, model, train_loader, train_sampler,
         )
         print(f"\n[PROFILER] Saved: {timing_path}")
 
-        # Serial fraction = AllReduce + barrier
         serial_ms   = ar_arr + bar_arr
         parallel_ms = tot_arr - serial_ms
-        # Gunakan median untuk robustness terhadap outlier infrastruktur
+
         f_val       = np.median(parallel_ms) / np.median(tot_arr)
         s_val       = np.median(serial_ms)   / np.median(tot_arr)
 
@@ -473,9 +423,6 @@ def main():
         static_graph=True,
     )
 
-    # Pasang AllReduce hook — aktif di semua konfigurasi
-    # Di 1 GPU: hook terpasang tapi tidak pernah dipanggil → ar_ms = 0
-    # Di 2/4 GPU: hook capture setiap bucket AllReduce NCCL
     ar_timer = AllReduceTimer()
     model.register_comm_hook(
         state=dist.group.WORLD,
